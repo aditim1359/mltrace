@@ -1,4 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+
+from git.index import typ
+from sqlalchemy.exc import IntegrityError
 from mltrace.db.utils import (
     _create_engine_wrapper,
     _initialize_db_tables,
@@ -8,6 +11,7 @@ from mltrace.db.utils import (
     _get_data_and_model_args,
     _load,
     _save,
+    _get_view_name,
 )
 from mltrace.db import (
     Component,
@@ -15,16 +19,23 @@ from mltrace.db import (
     IOPointer,
     PointerTypeEnum,
     Tag,
+    Label,
     component_run_output_association,
+    deleted_labels,
+    output_table,
+    feedback_table,
 )
 from mltrace.db.models import component_run_output_association
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, text
 from sqlalchemy.orm import sessionmaker, joinedload
 from sqlalchemy.sql.expression import Tuple
+from sqlalchemy.dialects.postgresql import insert
 
 import ctypes
 import hashlib
+import inspect
 import logging
+import sqlalchemy
 import typing
 
 
@@ -170,6 +181,7 @@ class Store(object):
         names: typing.List[str],
         values: typing.List[typing.Any] = None,
         pointer_type: PointerTypeEnum = None,
+        labels: typing.List[str] = None,
     ) -> typing.List[IOPointer]:
         """Creates io pointers around the specified path names. Retrieves
         existing io pointer if exists in DB, otherwise creates a new one with
@@ -186,6 +198,12 @@ class Store(object):
             )
             .all()
         )
+        # Create label vector
+        label_vec = self.get_labels(labels) if labels else None
+        if res and labels:
+            for iop in res:
+                iop.add_labels(label_vec)
+
         res_names_values = set([(r.name, r.value) for r in res])
         need_to_add = set(zip(names, values)) - res_names_values
 
@@ -203,6 +221,9 @@ class Store(object):
                 )
                 for name, value in need_to_add
             ]
+            if labels:
+                for iop in iops:
+                    iop.add_labels(label_vec)
             self.session.add_all(iops)
             self.session.commit()
             return res + iops
@@ -215,6 +236,7 @@ class Store(object):
         value: typing.Any = "",
         pointer_type: PointerTypeEnum = None,
         create=True,
+        labels: typing.List[str] = None,
     ) -> IOPointer:
         """Creates an io pointer around the specified path.
         Retrieves existing io pointer if exists in DB,
@@ -234,6 +256,9 @@ class Store(object):
             .all()
         )
         same_name_res = [r[0] for r in same_name_res]
+
+        # Create label vector
+        label_vec = self.get_labels(labels) if labels else None
 
         if len(same_name_res) > 0 and bytes(same_name_res[0]) != hval:
             logging.warning(
@@ -260,11 +285,16 @@ class Store(object):
                 pointer_type = _map_extension_to_enum(name)
 
             iop = IOPointer(name=name, value=hval, pointer_type=pointer_type)
+            if labels:
+                iop.add_labels(label_vec)
             self.session.add(iop)
             self.session.commit()
             return iop
 
         # Return existing object
+        # Add labels if they exist
+        if labels:
+            res[0].add_labels(label_vec)
         return res[0]
 
     def delete_component(self, component: Component):
@@ -333,10 +363,16 @@ class Store(object):
         if len(component_run.stale) > 0:
             logging.warning(component_run.stale)
 
+        # Dedup labels
+        for inp in component_run.inputs:
+            inp.dedup_labels()
+        for out in component_run.outputs:
+            out.dedup_labels()
+
         # Commit to DB
         self.session.add(component_run)
         logging.info(
-            f"Committing ComponentRun of type "
+            f"Committing ComponentRun {component_run.id} of type "
             + f'"{component_run.component_name}" to the database.'
         )
         self.session.commit()
@@ -654,14 +690,22 @@ class Store(object):
         # Return a list of the ComponentRuns in the order
         return flagged_output_ids, trace_nodes_counts
 
-    def get_all_tags(self) -> typing.List[Tag]:
+    def get_tags(self) -> typing.List[Tag]:
         return self.session.query(Tag).all()
 
-    def get_io_pointers_from_args(self, **kwargs):
+    def get_io_pointers_from_args(
+        self, should_filter=True, labels: typing.List[str] = None, **kwargs
+    ):
         """Filters kwargs to data and model types,
         then gets corresponding IOPointers."""
 
-        args_filtered = _get_data_and_model_args(**kwargs)
+        args_filtered = kwargs
+        if should_filter:
+            args_filtered = _get_data_and_model_args(**kwargs)
+
+        # Create label vector
+        label_vec = self.get_labels(labels) if labels else None
+
         io_pointers = []
         # Hash each arg and see if the corresponding IOPointer exists
         for key, value in args_filtered.items():
@@ -691,6 +735,8 @@ class Store(object):
                     )
                     .all()
                 )
+                if label_vec:
+                    res[0].add_labels(label_vec)
                 io_pointers.append(res[0])
                 continue
 
@@ -704,12 +750,372 @@ class Store(object):
             )
 
             if res:
+                if label_vec:
+                    res.add_labels(label_vec)
                 io_pointers.append(res)
                 continue
 
             # Save artifact and create new IOPointer
             pathname = _save(value, var_name=key, from_client=False)
-            iop = self.get_io_pointer(pathname, value)
+            iop = self.get_io_pointer(pathname, value, labels=labels)
             io_pointers.append(iop)
 
         return io_pointers
+
+    def get_label(self, label_id: str):
+        res = self.session.query(Label).filter(Label.id == label_id).first()
+
+        # If label does not exist, create it
+        if not res:
+            label = Label(id=label_id)
+            self.session.add(label)
+            self.session.commit()
+            return label
+
+        return res
+
+    def get_labels(self, label_ids: typing.List[str]):
+
+        res = self.session.query(Label).filter(Label.id.in_(label_ids)).all()
+        need_to_add = list(set(label_ids) - set([r.id for r in res]))
+
+        if len(need_to_add) > 0:
+            labels = [Label(id=label_id) for label_id in need_to_add]
+            self.session.add_all(labels)
+            self.session.commit()
+            return res + labels
+
+        return res
+
+    def assert_not_deleted_labels(
+        self,
+        io_pointers: typing.List[IOPointer],
+        staleness_threshold: int = 0,
+    ):
+        """Asserts that all labels are not deleted."""
+        all_labels = [iop.labels for iop in io_pointers]
+        all_labels = [lab.id for labels in all_labels for lab in labels]
+
+        deleted_label_objects = self.session.query(deleted_labels).filter(
+            deleted_labels.c.label.in_(all_labels)
+        )
+        hard_deleted_label_objects = deleted_label_objects.filter(
+            deleted_labels.c.deletion_request_time
+            < datetime.now() - timedelta(seconds=staleness_threshold)
+        ).all()
+        soft_deleted_label_objects = deleted_label_objects.filter(
+            deleted_labels.c.deletion_request_time
+            >= datetime.now() - timedelta(seconds=staleness_threshold)
+        ).all()
+
+        if hard_deleted_label_objects:
+            raise RuntimeError(
+                f"Label(s) {hard_deleted_label_objects}"
+                + f" have been deleted."
+            )
+
+        if soft_deleted_label_objects:
+            for label, time in soft_deleted_label_objects:
+                logging.warning(
+                    f"You are reading label {label}, which was deleted "
+                    + f"{(datetime.now() - time).days} days ago."
+                )
+
+    def propagate_labels(
+        self, inputs: typing.List[IOPointer], outputs: typing.List[IOPointer]
+    ):
+        """
+        Propagates labels from inputs to outputs.
+        """
+        all_labels = [inp.labels for inp in inputs]
+        all_labels = [lab for labels in all_labels for lab in labels]
+        for out in outputs:
+            out.add_labels(all_labels)
+            self.session.add(out)
+        self.session.commit()
+
+    def delete_label(self, label_id: str):
+        stmt = insert(deleted_labels).values(
+            label=label_id, deletion_request_time=datetime.now()
+        )
+        stmt = stmt.on_conflict_do_nothing(
+            constraint=deleted_labels.primary_key,
+        )
+        try:
+            self.session.execute(stmt)
+            self.session.commit()
+        except Exception as e:
+            if type(e) == sqlalchemy.exc.IntegrityError:
+                raise RuntimeError(f"Label {label_id} does not exist.")
+            pass
+
+    def delete_labels(self, label_ids: typing.List[str]):
+        stmt = insert(deleted_labels).values(
+            [
+                {"label": label_id, "deletion_request_time": datetime.now()}
+                for label_id in label_ids
+            ]
+        )
+        stmt = stmt.on_conflict_do_nothing(
+            constraint=deleted_labels.primary_key,
+        )
+        self.session.execute(stmt)
+        self.session.commit()
+
+    def retrieve_deleted_labels(self):
+        return self.session.query(deleted_labels).all()
+
+    def retrieve_io_pointers_for_label(self, label_id: str):
+        """Retrieves all IOPointers that have the given label."""
+        label = self.session.query(Label).filter(Label.id == label_id).first()
+        if not label:
+            raise RuntimeError(f"Label {label_id} does not exist.")
+        return label.io_pointers
+
+    def get_all_labels(self):
+        return self.session.query(Label).all()
+
+    def log_output(
+        self,
+        task_name: str,
+        identifier: str,
+        val: float,
+    ):
+        """
+        Logs an output value to the output table.
+        """
+
+        stmt = insert(output_table).values(
+            timestamp=datetime.now(),
+            identifier=identifier,
+            task_name=task_name,
+            value=val,
+        )
+        self.session.execute(stmt)
+        self.session.commit()
+
+    def log_outputs(
+        self,
+        task_name: str,
+        identifiers: typing.List[str],
+        vals: typing.List[float],
+    ):
+        """
+        Logs an output value to the output table.
+        """
+
+        stmt = insert(output_table).values(
+            [
+                {
+                    "timestamp": datetime.now(),
+                    "identifier": i,
+                    "task_name": task_name,
+                    "value": v,
+                }
+                for i, v in zip(identifiers, vals)
+            ]
+        )
+
+        self.session.execute(stmt)
+        self.session.commit()
+
+    def log_feedback(
+        self,
+        task_name: str,
+        identifier: str,
+        val: float,
+    ):
+        """
+        Logs a feedback value to the feedback table.
+        """
+
+        stmt = insert(feedback_table).values(
+            timestamp=datetime.now(),
+            identifier=identifier,
+            task_name=task_name,
+            value=val,
+        )
+        self.session.execute(stmt)
+        self.session.commit()
+
+    def log_feedbacks(
+        self,
+        task_name: str,
+        identifiers: typing.List[str],
+        vals: typing.List[float],
+    ):
+        """
+        Logs an output value to the output table.
+        """
+
+        stmt = insert(feedback_table).values(
+            [
+                {
+                    "timestamp": datetime.now(),
+                    "identifier": i,
+                    "task_name": task_name,
+                    "value": v,
+                }
+                for i, v in zip(identifiers, vals)
+            ]
+        )
+
+        self.session.execute(stmt)
+        self.session.commit()
+
+    def get_outputs_or_feedback(
+        self,
+        task_name: str,
+        tablename: str = "output_table",
+        limit: int = None,
+        window_size: int = None,
+    ):
+        if tablename not in ["output_table", "feedback_table"]:
+            raise ValueError(f"Invalid table name {tablename}")
+
+        table = output_table if tablename == "output_table" else feedback_table
+
+        query = self.session.query(
+            table.c.timestamp,
+            table.c.identifier,
+            table.c.value,
+        ).filter(table.c.task_name == task_name)
+
+        if limit:
+            query = query.order_by(table.c.timestamp.desc()).limit(limit)
+
+        if window_size:
+            query = query.filter(
+                table.c.timestamp
+                >= datetime.now() - timedelta(seconds=window_size)
+            )
+
+        return query.all()
+
+    def compute_metric(
+        self,
+        task_name: str,
+        metric_fn: typing.Callable,
+        window_size: int = None,
+    ):
+        """
+        Computes a metric over the specified window (in seconds).
+        """
+        # Check the function is well formed (has y_true, y_pred signature)
+        args = inspect.signature(metric_fn)
+        if len(args.parameters) < 2:
+            raise RuntimeError(
+                "The function must take at least 2 arguments: y_true, y_pred."
+            )
+
+        output_join_conditions = [output_table.c.task_name == task_name]
+        feedback_join_conditions = [feedback_table.c.task_name == task_name]
+
+        if window_size:
+            output_join_conditions.append(
+                output_table.c.timestamp
+                >= datetime.now() - timedelta(seconds=window_size)
+            )
+            feedback_join_conditions.append(
+                feedback_table.c.timestamp
+                >= datetime.now() - timedelta(seconds=window_size)
+            )
+
+        join_conditions = output_join_conditions + feedback_join_conditions
+        outputs_feedback_joined = (
+            self.session.query(feedback_table.c.value, output_table.c.value)
+            .join(
+                output_table,
+                output_table.c.identifier == feedback_table.c.identifier,
+            )
+            .filter(and_(*join_conditions))
+        ).all()
+
+        # Apply the function to each pair of outputs and feedback
+        y_true = [float(out[0]) for out in outputs_feedback_joined]
+        y_pred = [float(out[1]) for out in outputs_feedback_joined]
+
+        # Try computing metric function
+
+        return metric_fn(y_true, y_pred)
+
+    def create_view(self, task_name: str, window_size: int = None):
+        """
+        Creates a materialized view on joined outputs and feedback.
+        If window_size is specified, only the window_size most recent joined
+        values are kept.
+        """
+
+        output_join_conditions = [output_table.c.task_name == task_name]
+        feedback_join_conditions = [feedback_table.c.task_name == task_name]
+        join_conditions = output_join_conditions + feedback_join_conditions
+
+        stmt = (
+            self.session.query(
+                feedback_table.c.identifier.label("identifier"),
+                feedback_table.c.value.label("feedback_value"),
+                output_table.c.value.label("output_value"),
+            )
+            .join(
+                output_table,
+                output_table.c.identifier == feedback_table.c.identifier,
+            )
+            .filter(and_(*join_conditions))
+        )
+
+        if window_size:
+            stmt = stmt.order_by(feedback_table.c.timestamp.desc()).limit(
+                window_size
+            )
+
+        view_name = _get_view_name(task_name, window_size)
+        str_stmt = stmt.statement.compile(
+            compile_kwargs={"literal_binds": True}
+        )
+
+        self.session.execute(
+            f"CREATE MATERIALIZED VIEW IF NOT EXISTS {view_name} AS {str_stmt}"
+        )
+        self.session.execute(
+            f"CREATE UNIQUE INDEX ON {view_name} (identifier)"
+        )
+
+        # Create trigger to update the view when new feedbacks are logged
+        trigger_fn = f"""CREATE OR REPLACE FUNCTION refresh_view_{view_name}()
+            RETURNS TRIGGER LANGUAGE plpgsql
+            AS $$
+            BEGIN
+            REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name};
+            RETURN NULL;
+            END $$;"""
+
+        trigger_stmt = f"""CREATE OR REPLACE TRIGGER refresh_view_{view_name}
+            AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE
+            ON feedback
+            FOR EACH STATEMENT
+            EXECUTE PROCEDURE refresh_view_{view_name}();"""
+
+        self.session.execute(trigger_fn)
+        self.session.execute(trigger_stmt)
+
+        self.session.commit()
+
+    def compute_metric_from_view(
+        self,
+        task_name: str,
+        metric_fn: typing.Callable,
+        window_size: int = None,
+    ):
+        """
+        Computes a metric over the specified window (in seconds).
+        """
+
+        view_name = _get_view_name(task_name, window_size)
+        stmt = "SELECT feedback_value, output_value FROM {}".format(view_name)
+        res = self.session.execute(stmt).fetchall()
+
+        # Apply the function to each pair of outputs and feedback
+        y_true = [float(out[0]) for out in res]
+        y_pred = [float(out[1]) for out in res]
+
+        return metric_fn(y_true, y_pred)

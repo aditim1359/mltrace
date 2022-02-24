@@ -14,7 +14,6 @@ import sys
 import typing
 import uuid
 
-
 _db_uri = utils.get_db_uri()
 
 # --------------------- Database management functions ------------------- #
@@ -59,7 +58,7 @@ def save(obj, pathname: str = None) -> str:
 
 
 def create_component(
-        name: str, description: str, owner: str, tags: typing.List[str] = []
+    name: str, description: str, owner: str, tags: typing.List[str] = []
 ):
     """Creates a component entity in the database."""
     store = Store(_db_uri)
@@ -73,9 +72,9 @@ def tag_component(component_name: str, tags: typing.List[str]):
 
 
 def log_component_run(
-        component_run: ComponentRun,
-        set_dependencies_from_inputs=True,
-        staleness_threshold: int = (60 * 60 * 24 * 30),
+    component_run: ComponentRun,
+    set_dependencies_from_inputs=True,
+    staleness_threshold: int = (60 * 60 * 24 * 30),
 ):
     """Takes client-facing ComponentRun object and logs it to the DB."""
     store = Store(_db_uri)
@@ -152,16 +151,16 @@ def create_random_ids(num_outputs=1) -> typing.List[str]:
 
 # TODO(shreyashankar): change logging.debug to thrown errors
 def register(
-        component_name: str,
-        inputs: typing.List[str] = [],
-        outputs: typing.List[str] = [],
-        input_vars: typing.List[str] = [],
-        output_vars: typing.List[str] = [],
-        input_kwargs: typing.Dict[str, str] = {},
-        output_kwargs: typing.Dict[str, str] = {},
-        endpoint: bool = False,
-        staleness_threshold: int = (60 * 60 * 24 * 30),
-        auto_log: bool = False,
+    component_name: str,
+    inputs: typing.List[str] = [],
+    outputs: typing.List[str] = [],
+    input_vars: typing.List[str] = [],
+    output_vars: typing.List[str] = [],
+    input_kwargs: typing.Dict[str, str] = {},
+    output_kwargs: typing.Dict[str, str] = {},
+    endpoint: bool = False,
+    staleness_threshold: int = (60 * 60 * 24 * 30),
+    auto_log: bool = False,
 ):
     def actual_decorator(func):
         @functools.wraps(func)
@@ -275,7 +274,7 @@ def register(
                     continue
                 if isinstance(local_vars[key], list):
                     if not isinstance(local_vars[val], list) or len(
-                            local_vars[key]
+                        local_vars[key]
                     ) != len(local_vars[val]):
                         raise ValueError(
                             f'Value "{val}" does not have the same length as'
@@ -302,7 +301,7 @@ def register(
                     continue
                 if isinstance(local_vars[key], list):
                     if not isinstance(local_vars[val], list) or len(
-                            local_vars[key]
+                        local_vars[key]
                     ) != len(local_vars[val]):
                         raise ValueError(
                             f'Value "{val}" does not have the same length as'
@@ -470,10 +469,10 @@ def unflag_all():
 
 
 def get_history(
-        component_name: str,
-        limit: int = 10,
-        date_lower: typing.Union[datetime, str] = datetime.min,
-        date_upper: typing.Union[datetime, str] = datetime.max,
+    component_name: str,
+    limit: int = 10,
+    date_lower: typing.Union[datetime, str] = datetime.min,
+    date_upper: typing.Union[datetime, str] = datetime.max,
 ) -> typing.List[ComponentRun]:
     """Returns a list of ComponentRuns that are part of the component's
     history."""
@@ -545,7 +544,6 @@ def get_component_run_information(component_run_id: str) -> ComponentRun:
     d.update(
         {"inputs": inputs, "outputs": outputs, "dependencies": dependencies}
     )
-
     return ComponentRun.from_dictionary(d)
 
 
@@ -573,7 +571,7 @@ def get_recent_run_ids(limit: int = 5, last_run_id=None):
 
 
 def get_io_pointer(
-        io_pointer_id: str, io_pointer_val: typing.Any = None, create=True
+    io_pointer_id: str, io_pointer_val: typing.Any = None, create=True
 ):
     """Returns IO Pointer metadata."""
     store = Store(_db_uri)
@@ -581,9 +579,9 @@ def get_io_pointer(
     return IOPointer.from_dictionary(iop.__dict__)
 
 
-def get_all_tags() -> typing.List[str]:
+def get_tags() -> typing.List[str]:
     store = Store(_db_uri)
-    res = store.get_all_tags()
+    res = store.get_tags()
     tags = [t.name for t in res]
     return tags
 
@@ -631,3 +629,61 @@ def review_flagged_outputs():
     alphabetically."""
     store = Store(_db_uri)
     return store.review_flagged_outputs()
+
+
+def retract_label(label_id: str):
+    store = Store(_db_uri)
+    store.delete_label(label_id)
+
+
+def retract_labels(label_ids: typing.List[str]):
+    store = Store(_db_uri)
+    store.delete_labels(label_ids)
+
+
+def retrieve_retracted_labels():
+    store = Store(_db_uri)
+    return store.retrieve_deleted_labels()
+
+
+def retrieve_io_pointers_for_label(label_id: str):
+    store = Store(_db_uri)
+    iops = store.retrieve_io_pointers_for_label(label_id)
+    return [IOPointer.from_dictionary(iop.__dict__) for iop in iops]
+
+
+def get_labels() -> typing.List[str]:
+    store = Store(_db_uri)
+    return [label.id for label in store.get_all_labels()]
+
+
+def create_labels(label_ids: typing.List[str]):
+    store = Store(_db_uri)
+    store.get_labels(label_ids)
+
+
+def log_output(
+    task_name: str,
+    identifier: str,
+    val: float,
+):
+    store = Store(_db_uri)
+    store.log_output(identifier=identifier, task_name=task_name, val=val)
+
+
+def log_feedback(
+    task_name: str,
+    identifier: str,
+    val: float,
+):
+    store = Store(_db_uri)
+    store.log_feedback(identifier=identifier, task_name=task_name, val=val)
+
+
+def compute_metric(
+    task_name: str,
+    metric_fn: typing.Callable,
+    window_size: int = None,
+):
+    store = Store(_db_uri)
+    store.compute_metric(task_name, metric_fn, window_size)

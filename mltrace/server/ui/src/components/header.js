@@ -31,6 +31,11 @@ class Header extends Component {
     onKeyUp(e) {
         if (e.key === "Enter") {
             this.props.onCommand(e.target.value);
+            
+            // update urlPath when user input different command 
+            var urlPath = "/" + e.target.value.split(" ").filter(str => str !== "").join("/");
+            this.props.history.push(urlPath);
+
             this.setState({ submitted: true });
         }
     }
@@ -46,7 +51,7 @@ class Header extends Component {
         CustomToaster.show({
             message: <div>
                 <Text>
-                    <tt>`{this.inputValue.value}`</tt> copied to clipboard.
+                    <tt>{this.inputValue.value}</tt> copied to clipboard.
                 </Text>
             </div>,
             icon: "tick",
@@ -72,7 +77,7 @@ class Header extends Component {
                 <Navbar.Group align={Alignment.LEFT}>
                     <Navbar.Heading>mltrace</Navbar.Heading>
                     <Navbar.Divider />
-                    <Link to="/"><Button className="bp3-minimal" icon="home" text="Home" style={{ marginRight: '0.5em' }} onClick={() => this.props.onCommand("recent")} /></Link>
+                    <Link to="/recent"><Button className="bp3-minimal" icon="home" text="Home" style={{ marginRight: '0.5em' }} onClick={() => this.props.onCommand("recent")} /></Link>
                     <InputGroup
                         className="bp3-minimal"
                         leftIcon="chevron-right"

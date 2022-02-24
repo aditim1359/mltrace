@@ -7,7 +7,7 @@ README = (HERE / "README.md").read_text()
 
 setup(
     name="mltrace",
-    version="0.16",
+    version="0.17",
     description="Lineage and tracing for ML pipelines",
     long_description=README,
     long_description_content_type="text/markdown",
@@ -30,6 +30,7 @@ setup(
         "psycopg2-binary",
         "pytest",
         "python-dotenv",
+        "scikit-learn",
         "sqlalchemy",
     ],
     entry_points="""

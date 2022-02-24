@@ -5,8 +5,10 @@ from sqlalchemy.sql.schema import UniqueConstraint
 from sqlalchemy.sql.sqltypes import Boolean
 from mltrace.db.base import Base
 from sqlalchemy import (
+    ARRAY,
     Column,
     JSON,
+    Index,
     String,
     LargeBinary,
     Integer,
@@ -16,6 +18,8 @@ from sqlalchemy import (
     Enum,
     PickleType,
     UniqueConstraint,
+    text,
+    Numeric,
 )
 from sqlalchemy.orm import relationship, backref
 from sqlalchemy.schema import ForeignKeyConstraint
@@ -31,12 +35,82 @@ class PointerTypeEnum(str, enum.Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# Tables for monitoring extensions
+
+output_table = Table(
+    "outputs",
+    Base.metadata,
+    Column("timestamp", DateTime),
+    Column("identifier", String),
+    Column("task_name", String),
+    Column("value", Numeric),
+    Index("outputs_ts_name_asc", "timestamp", "task_name"),
+    Index(
+        "outputs_ts_name_desc",
+        text("timestamp DESC"),
+        "task_name",
+    ),
+)
+
+feedback_table = Table(
+    "feedback",
+    Base.metadata,
+    Column("timestamp", DateTime),
+    Column("identifier", String),
+    Column("task_name", String),
+    Column("value", Numeric),
+    Index("feedback_ts_name_asc", "timestamp", "task_name"),
+    Index(
+        "feedback_ts_name_desc",
+        text("timestamp DESC"),
+        "task_name",
+    ),
+)
+
+
 component_tag_association = Table(
     "component_tags",
     Base.metadata,
     Column("component_name", String, ForeignKey("components.name")),
     Column("tag_name", String, ForeignKey("tags.name")),
 )
+
+
+# Functionality for label tracking.
+
+label_io_pointer_association = Table(
+    "labels_io_pointers",
+    Base.metadata,
+    Column("label", String, ForeignKey("labels.id"), index=True),
+    Column("io_pointer_name", String),
+    Column("io_pointer_value", LargeBinary),
+    ForeignKeyConstraint(
+        ["io_pointer_name", "io_pointer_value"],
+        ["io_pointers.name", "io_pointers.value"],
+    ),
+)
+
+deleted_labels = Table(
+    "deleted_labels",
+    Base.metadata,
+    Column("label", String, ForeignKey("labels.id"), primary_key=True),
+    Column("deletion_request_time", DateTime),
+)
+
+
+class Label(Base):
+    __tablename__ = "labels"
+    id = Column(String, primary_key=True)
+    io_pointers = relationship(
+        "IOPointer",
+        secondary=label_io_pointer_association,
+        cascade="all",
+        backref="io_pointers",
+    )
+
+    def __init__(self, id: str):
+        self.id = id
+        self.io_pointers = []
 
 
 class Component(Base):
@@ -83,6 +157,13 @@ class IOPointer(Base):
     pointer_type = Column(Enum(PointerTypeEnum))
     flag = Column(Boolean, default=False)
 
+    labels = relationship(
+        "Label",
+        secondary=label_io_pointer_association,
+        cascade="all",
+        backref="labels",
+    )
+
     __table_args__ = (UniqueConstraint("name", "value", name="_iop_uc"),)
 
     def __init__(
@@ -90,11 +171,13 @@ class IOPointer(Base):
         name: str,
         value: bytes = b"",
         pointer_type: PointerTypeEnum = PointerTypeEnum.UNKNOWN,
+        labels=[],
     ):
         self.name = name
         self.value = value
         self.pointer_type = pointer_type
         self.flag = False
+        self.labels = labels
 
     def set_pointer_type(self, pointer_type: PointerTypeEnum):
         self.pointer_type = pointer_type
@@ -104,6 +187,15 @@ class IOPointer(Base):
 
     def clear_flag(self):
         self.flag = False
+
+    def add_label(self, label: Label):
+        self.labels = self.labels + [label]
+
+    def add_labels(self, labels: typing.list[Label]):
+        self.labels = self.labels + labels
+
+    def dedup_labels(self):
+        self.labels = list(set(self.labels))
 
 
 component_run_input_association = Table(
@@ -165,6 +257,9 @@ class ComponentRun(Base):
     code_snapshot = Column(LargeBinary)
     start_timestamp = Column(DateTime)
     end_timestamp = Column(DateTime)
+    mlflow_run_id = Column(String)
+    mlflow_run_params = Column(PickleType)
+    mlflow_run_metrics = Column(PickleType)
     inputs = relationship(
         "IOPointer",
         secondary=component_run_input_association,
@@ -198,6 +293,18 @@ class ComponentRun(Base):
         self.dependencies = []
         self.stale = []
         self.test_results = JSON.NULL
+
+    def set_mlflow_run_id(self, mlflow_run_id: str):
+        """Call this function to set the mlflow component run id"""
+        self.mlflow_run_id = mlflow_run_id
+
+    def set_mlflow_run_metrics(self, mlflow_run_metrics: dict):
+        """Call this function to set the mlflow component run id"""
+        self.mlflow_run_metrics = mlflow_run_metrics
+
+    def set_mlflow_run_params(self, mlflow_run_params: dict):
+        """Call this function to set the mlflow component run id"""
+        self.mlflow_run_params = mlflow_run_params
 
     def set_start_timestamp(self, ts: datetime = None):
         """Call this function to set the start timestamp
